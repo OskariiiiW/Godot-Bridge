@@ -1,0 +1,7 @@
+# Godot editor cache. Also holds the bridge's runtime connection files
+# (.godot/godot_bridge/editor-<pid>.json), which contain a session token.
+.godot/
+
+# Python bytecode
+__pycache__/
+*.pyc

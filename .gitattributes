@@ -1,0 +1,8 @@
+# Normalize line endings so the addon works the same on every platform.
+* text=auto eol=lf
+*.png binary
+
+# Archives (GitHub's "Download ZIP", release zips) contain only the addon.
+/**            export-ignore
+/addons        !export-ignore
+/addons/**     !export-ignore
