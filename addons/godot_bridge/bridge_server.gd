@@ -10,7 +10,7 @@ extends Node
 ##   {"id": 1, "ok": true, "result": {...}}  or  {"id": 1, "ok": false, "error": "..."}
 
 const CONNECTION_DIR := "res://.godot/godot_bridge"
-const VERSION := "0.1.0"
+const VERSION := "0.1.1"
 ## How long a sync waits for the editor's filesystem scan to finish.
 const SYNC_TIMEOUT_MS := 10000
 ## How long game_play waits for the game's bridge helper to report in.
