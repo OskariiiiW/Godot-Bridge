@@ -12,18 +12,22 @@ A Godot editor plugin plus an [MCP](https://modelcontextprotocol.io) server that
 
 1. Download `godot-bridge-vX.Y.Z.zip` from the [latest release](https://github.com/OskariiiiW/Godot-Bridge/releases/latest) and extract it into your project folder. It contains `addons/godot_bridge/`, so the files land in the right place. Alternatively, copy `addons/godot_bridge/` from this repository into your project's `addons/` folder.
 2. In Godot, open **Project > Project Settings > Plugins** and enable **Godot Bridge**. This also adds a `GodotBridgeGame` autoload, which the game tools use to reach the running game.
-3. Register the MCP server with your agent. For Claude Code, run this from your project folder:
+3. Start your agent in the project folder. When the plugin is enabled, it adds a `godot-bridge` server to `.mcp.json` in your project, creating the file if needed. Claude Code reads that file and asks once whether to trust the server. The entry uses a path relative to the project, so you can commit `.mcp.json` for everyone working on it.
+
+   The plugin never overwrites an existing `.mcp.json`: it adds its entry and keeps the rest. It leaves the file alone if it already runs the server, or if it isn't valid JSON (the editor's output then says so). If the plugin was already enabled before this feature existed, turn it off and on again.
+
+   To register the server by hand instead, run this from your project folder (on Windows, use `py` or `python` instead of `python3`):
 
    ```sh
-   claude mcp add godot -- python3 addons/godot_bridge/mcp/server.py
+   claude mcp add godot-bridge -- python3 addons/godot_bridge/mcp/server.py
    ```
 
-   On Windows, use `python` (or `py`) instead of `python3`. Other MCP clients take the same command in their config, for example:
+   Clients that don't read `.mcp.json` take the same command in their own config, for example:
 
    ```json
    {
      "mcpServers": {
-       "godot": {
+       "godot-bridge": {
          "command": "python3",
          "args": ["/path/to/your/project/addons/godot_bridge/mcp/server.py"]
        }

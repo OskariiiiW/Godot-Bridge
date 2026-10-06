@@ -25,12 +25,18 @@ const BRIDGE_SCRIPTS := {
 ## Scripts a game loads when it starts, checked by a reload so a broken one is
 ## caught before the next game_play.
 const GAME_SCRIPTS := ["game/bridge_game.gd"]
+const McpConfig := preload("res://addons/godot_bridge/mcp_config.gd")
 
 var server: Node
 var debugger: EditorDebuggerPlugin
 
 func _enable_plugin() -> void:
 	add_autoload_singleton(GAME_AUTOLOAD, SCRIPTS_DIR + "game/game_loader.gd")
+	var message := McpConfig.register(ProjectSettings.globalize_path("res://"), SCRIPTS_DIR.trim_prefix("res://").trim_suffix("/"))
+	if message.begins_with("WARNING: "):
+		push_warning("Godot Bridge: " + message.trim_prefix("WARNING: "))
+	elif not message.is_empty():
+		print("Godot Bridge: " + message)
 
 func _disable_plugin() -> void:
 	remove_autoload_singleton(GAME_AUTOLOAD)
