@@ -12,30 +12,43 @@ A Godot editor plugin plus an [MCP](https://modelcontextprotocol.io) server that
 
 1. Download `godot-bridge-vX.Y.Z.zip` from the [latest release](https://github.com/OskariiiiW/Godot-Bridge/releases/latest) and extract it into your project folder. It contains `addons/godot_bridge/`, so the files land in the right place. Alternatively, copy `addons/godot_bridge/` from this repository into your project's `addons/` folder.
 2. In Godot, open **Project > Project Settings > Plugins** and enable **Godot Bridge**. This also adds a `GodotBridgeGame` autoload, which the game tools use to reach the running game.
-3. Start your agent in the project folder. When the plugin is enabled, it adds a `godot-bridge` server to `.mcp.json` in your project, creating the file if needed. Claude Code reads that file and asks once whether to trust the server. The entry uses a path relative to the project, so you can commit `.mcp.json` for everyone working on it.
-
-   The plugin never overwrites an existing `.mcp.json`: it adds its entry and keeps the rest. It leaves the file alone if it already runs the server, or if it isn't valid JSON (the editor's output then says so). If the plugin was already enabled before this feature existed, turn it off and on again.
-
-   To register the server by hand instead, run this from your project folder (on Windows, use `py` or `python` instead of `python3`):
-
-   ```sh
-   claude mcp add godot-bridge -- python3 addons/godot_bridge/mcp/server.py
-   ```
-
-   Clients that don't read `.mcp.json` take the same command in their own config, for example:
-
-   ```json
-   {
-     "mcpServers": {
-       "godot-bridge": {
-         "command": "python3",
-         "args": ["/path/to/your/project/addons/godot_bridge/mcp/server.py"]
-       }
-     }
-   }
-   ```
-
+3. Connect your agent, as described below.
 4. Keep the project open in the editor while the agent works. The server finds the editor on its own.
+
+### Connecting your agent
+
+> **Start your agent in the Godot project folder**, the one with `project.godot` in it. The setup below lives in that folder, and the agent won't find it if it starts anywhere else, such as the root of a bigger repository that the Godot project is a subfolder of.
+
+#### Claude Code: automatic
+
+When the plugin is enabled, it adds a `godot-bridge` server to `.mcp.json` in your project folder, creating the file if needed. Start Claude Code in the project folder and it picks the server up, asking once whether to trust it. There is nothing else to set up.
+
+- The entry uses a path relative to the project, so you can commit `.mcp.json` for everyone working on the project.
+- The plugin never overwrites an existing `.mcp.json`. It adds its entry and keeps the rest, and it leaves the file alone if the server is already there or if the file isn't valid JSON (the editor's output then says so).
+- If the plugin was already enabled before you updated it to a version with this feature, turn it off and on again.
+
+To register the server by hand instead, run this in the project folder (on Windows, use `py` or `python` instead of `python3`):
+
+```sh
+claude mcp add godot-bridge -- python3 addons/godot_bridge/mcp/server.py
+```
+
+#### Other MCP clients: manual
+
+Other agents and editors (Cursor, VS Code, Claude Desktop and so on) keep their MCP servers in their own config files, so you need to add the server there yourself. Most of them use this format; see your client's documentation for where its file is:
+
+```json
+{
+  "mcpServers": {
+    "godot-bridge": {
+      "command": "python3",
+      "args": ["/path/to/your/project/addons/godot_bridge/mcp/server.py"]
+    }
+  }
+}
+```
+
+Use the full path to `server.py`, since these clients don't always start the server in your project folder. On Windows, use `py` or `python` as the command.
 
 ### Environment variables
 
