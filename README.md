@@ -10,7 +10,7 @@ A Godot editor plugin plus an [MCP](https://modelcontextprotocol.io) server that
 
 ## Installation
 
-1. Copy `addons/godot_bridge/` into your project's `addons/` folder.
+1. Download `godot-bridge-vX.Y.Z.zip` from the [latest release](https://github.com/OskariiiiW/Godot-Bridge/releases/latest) and extract it into your project folder. It contains `addons/godot_bridge/`, so the files land in the right place. Alternatively, copy `addons/godot_bridge/` from this repository into your project's `addons/` folder.
 2. In Godot, open **Project > Project Settings > Plugins** and enable **Godot Bridge**. This also adds a `GodotBridgeGame` autoload, which the game tools use to reach the running game.
 3. Register the MCP server with your agent. For Claude Code, run this from your project folder:
 
