@@ -86,7 +86,7 @@ Use the full path to `server.py`, since these clients don't always start the ser
 
 Each tool's full description, which the agent sees, is in [`mcp/server.py`](addons/godot_bridge/mcp/server.py).
 
-By default, games started with `game_play` get a throwaway copy of the project's `user://` folder, so testing never changes your real saves or settings. Pass `user_data: "real"` to use the real one.
+By default, games started with `game_play` get a throwaway copy of the project's `user://` folder, and test scripts run with `run_tests` a fresh, empty one each, so testing never changes your real saves or settings, and tests do not depend on them. Pass `user_data: "real"` to use the real one, or `"copy"`/`"empty"` to choose.
 
 ## How it works
 

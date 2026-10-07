@@ -88,9 +88,12 @@ TOOLS = [
         "description": (
             "Run the project's headless test scripts and report pass/fail with their errors. Files changed on disk "
             "are synced first, so the tests see new class_names. Each script runs in its own `godot --headless -s "
-            "<script>` (extending SceneTree or MainLoop) and passes when it exits with code 0 (quit(0)); the "
-            "editor keeps working meanwhile. Without scripts, the scripts in res://tests/ and res://test/ that "
-            "extend SceneTree or MainLoop are run. For a test framework, pass its command-line runner as the "
+            "<script>` (extending SceneTree or MainLoop), several at once, and passes when it exits with code 0 (quit(0)); the "
+            "editor keeps working meanwhile. Messages the engine prints as a script quits (leaked objects or resources) "
+            "are listed as exit_warnings, apart from errors. Without scripts, the scripts in res://tests/ and res://test/ that "
+            "extend SceneTree or MainLoop (directly or through other scripts) are run, except bases other tests extend that define no "
+            "_initialize of their own. Each script gets a fresh, empty user:// folder "
+            "unless user_data says otherwise, so tests neither change nor depend on the real saves and settings. For a test framework, pass its command-line runner as the "
             "script and its options in args (GUT: scripts ['res://addons/gut/gut_cmdln.gd'], args ['-gdir=res://test', '-gexit'])."
         ),
         "inputSchema": {
@@ -99,12 +102,15 @@ TOOLS = [
                 "scripts": {"type": "array", "items": {"type": "string"}, "description": "Test scripts or folders of them (default: res://tests/ and res://test/)."},
                 "args": {"type": "array", "items": {"type": "string"}, "description": "Extra command-line arguments passed to every run, after the script."},
                 "timeout": {"type": "number", "description": "Seconds each script may take before it is stopped (default 120)."},
+                "user_data": {"type": "string", "enum": ["copy", "empty", "real"], "description": "Each script's user:// folder: 'empty' (default) a fresh empty one, 'copy' a fresh throwaway copy of the real one, 'real' the player's own, which the tests may change."},
+                "jobs": {"type": "integer", "description": "How many scripts run at once (default a third of the CPU cores, at most 4; up to 16). Use 1 for tests with tight time limits of their own, or that share files outside user://."},
+                "details": {"type": "string", "enum": ["failures", "all"], "description": "'failures' (default): full results (errors, warnings, last output) only for failed scripts as failures, and passing scripts that printed errors or warnings as noisy, without their output. 'all': every script's full result as results."},
             },
         },
     },
     {
         "name": "sync_from_disk",
-        "description": "Make the editor pick up files changed outside it (scripts, scenes, resources, new class_names), as when its window regains focus. Run after editing project files on disk. This also rewrites the class cache (.godot/global_script_class_cache.cfg) that headless runs such as `godot --headless -s test.gd` read, so they see a new class_name only after a sync (run_tests syncs by itself). Open scenes changed on disk are reloaded in the editor; any that also have unsaved edits there are listed as unsaved_conflicts instead.",
+        "description": "Make the editor pick up files changed outside it (scripts, scenes, resources, new class_names), as when its window regains focus. Run after editing project files on disk. This also rewrites the class cache (.godot/global_script_class_cache.cfg) that headless runs such as `godot --headless -s test.gd` read, so they see a new class_name only after a sync (run_tests syncs by itself). Open scenes changed on disk, or that instance a scene changed on disk, are reloaded in the editor; any that also have unsaved edits there are listed as unsaved_conflicts (or stale_unsaved_scenes, when only an instanced scene changed) instead.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -285,19 +291,22 @@ TOOLS = [
         "description": (
             "Check scripts for errors after editing: syncs from disk, compiles each script fresh and returns "
             "every error with its file and line. Without paths it checks the whole project except res://addons/. "
-            "scenes: true also loads every scene to catch broken references and missing resources."
+            "scenes: true also loads every scene to catch broken references and missing resources. GDScript "
+            "warnings (unused variables, narrowing conversions and the like, as the script editor shows them under the "
+            "project's warning settings) come back apart, as warnings with warning_count; ok is about errors only."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Scripts (.gd) or scenes (.tscn) to check; default the whole project."},
                 "scenes": {"type": "boolean", "description": "Also load scenes (default false unless scene paths are given)."},
+                "warnings": {"type": "boolean", "description": "Also report GDScript warnings (default true)."},
             },
         },
     },
     {
         "name": "editor_log",
-        "description": "Recent output of the Godot editor: printed lines, warnings and errors, including those raised while syncing or importing (the last 500 are kept). A line that repeats while it is among the last few kept, such as warnings printed every frame, is kept once with its count, as \"<line> (N times)\", and moves to the end as the most recent.",
+        "description": "Recent output of the Godot editor: printed lines, warnings and errors, including those raised while syncing or importing (the last 500 are kept). Locations in editor_run code read as \"editor_run 12 code:3\" (run 12, line 3 of its code), also for errors raised after the run, such as from deferred calls or signal callbacks it connected. A line that repeats while it is among the last few kept, such as warnings printed every frame, is kept once with its count, as \"<line> (N times)\", and moves to the end as the most recent.",
         "inputSchema": {
             "type": "object",
             "properties": {

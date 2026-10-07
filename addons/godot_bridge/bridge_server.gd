@@ -42,6 +42,9 @@ const GAME_STEP_TIMEOUT_MS := 5000
 const NO_GAME_ERROR := "No game with the bridge helper is running from this editor. Start one with game_play."
 const EDITOR_LOG_LIMIT := 500
 const EDITOR_LOG_LEVELS := ["all", "warnings", "errors"]
+## Compiled editor_run code whose locations editor_log rewrites, the latest
+## ones: its errors can come long after the run, from callbacks it left behind.
+const EDITOR_RUN_SOURCES_KEPT := 50
 ## Screenshots kept in CONNECTION_DIR/screenshots; older ones are deleted.
 const SCREENSHOTS_KEPT := 20
 ## How often open scenes are checked for changes on disk.
@@ -84,9 +87,16 @@ var _next_editor_run := 0
 ## LogCapture counts them within one (see its add_counted()).
 var _editor_log
 var _editor_log_lines: Array[Dictionary] = []
+## Compiled editor_run code: {path, line_offset, label} (see code_runner.compile()).
+var _editor_run_sources := []
 ## Open scene path -> modified time of its file when the editor last loaded or
 ## saved it, which tells changes made on disk apart from the editor's own saves.
 var _scene_times := {}
+## Open scene path -> {path of a scene it instances, directly or deeper ->
+## that file's modified time when the open scene was loaded}: an open scene
+## keeps the instanced scenes it was loaded with, so it is stale once one
+## of them changes on disk, though its own file did not.
+var _dependency_times := {}
 var _next_scene_check := 0
 ## The gamescope process a background game runs in (see _play_background), or -1.
 var _background_pid := -1
@@ -96,12 +106,16 @@ var _background_scene := ""
 ## reaches the debugger. Kept after the game ends, until the next one starts.
 var _background_pipes: Array[FileAccess] = []
 var _background_partial := ["", ""]
+## Per pipe: whether its last line was noise, so indented lines after it are too.
+var _background_in_noise := [false, false]
 var _background_output: PackedStringArray = []
 const BACKGROUND_OUTPUT_KEPT := 200
 ## Lines from gamescope and its X server that say nothing about the game.
 ## The engine's start-up lines, left out of game_play's error logs.
 const ENGINE_BANNER := ["Godot Engine v", "OpenGL API ", "Vulkan ", "WARNING: Project setting"]
-const BACKGROUND_NOISE := ["[gamescope", "Tracing is enabled", "The XKEYBOARD keymap compiler", "> ", "Errors from xkbcomp", "(EE) failed to read Wayland events"]
+## Lines from gamescope and its Vulkan layer in a background game's output,
+## left out with the indented lines that continue them.
+const BACKGROUND_NOISE := ["[gamescope", "[Gamescope WSI]", "ATTENTION: default value of option", "Tracing is enabled", "The XKEYBOARD keymap compiler", "> ", "Errors from xkbcomp", "(EE) failed to read Wayland events"]
 var _terminal_colours := RegEx.create_from_string("\\x1b\\[[0-9;]*[A-Za-z]")
 ## Whether the bridge switched on "Keep Debug Server Open" and must switch it off.
 var _opened_debug_server := false
@@ -253,7 +267,7 @@ func _call(tool: String, args: Dictionary) -> Dictionary:
 		"game_log":
 			return await _game_request("log", {"lines": int(args.get("lines", 50)), "clear": bool(args.get("clear", false))})
 		"diagnostics":
-			return await _diagnostics(args.get("paths", []) if args.get("paths") is Array else [], bool(args.get("scenes", false)))
+			return await _diagnostics(args.get("paths", []) if args.get("paths") is Array else [], bool(args.get("scenes", false)), bool(args.get("warnings", true)))
 		"editor_log":
 			return _editor_log_reply(int(args.get("lines", 50)), bool(args.get("clear", false)), String(args.get("level", "all")))
 		"texture_view":
@@ -399,7 +413,9 @@ func export_state() -> Dictionary:
 		"editor_runs": _editor_runs,
 		"next_editor_run": _next_editor_run,
 		"editor_log_lines": _editor_log_lines,
+		"editor_run_sources": _editor_run_sources,
 		"scene_times": _scene_times,
+		"dependency_times": _dependency_times,
 		"background_pid": _background_pid,
 		"background_scene": _background_scene,
 		"background_pipes": _background_pipes,
@@ -434,7 +450,9 @@ func import_state(state: Dictionary) -> void:
 		_editor_log_lines.append(entry)
 	if _editor_log_lines.size() > EDITOR_LOG_LIMIT:
 		_editor_log_lines = _editor_log_lines.slice(_editor_log_lines.size() - EDITOR_LOG_LIMIT)
+	_editor_run_sources = state.get("editor_run_sources", [])
 	_scene_times = state.scene_times
+	_dependency_times = state.get("dependency_times", {})
 	_background_pid = state.background_pid
 	_background_scene = state.background_scene
 	_background_pipes.assign(state.background_pipes)
@@ -472,9 +490,11 @@ func _run(code: String, sync: bool, timeout: float) -> Dictionary:
 	var compiled: Dictionary = code_runner_script.compile(code)
 	if compiled.has("error"):
 		OS.remove_logger(capture)
+		_note_editor_run_source(compiled, "editor_run code")
 		return {"error": compiled.error, "logs": code_runner_script.code_lines(capture.take(), compiled)}
 	_next_editor_run += 1
 	var id := _next_editor_run
+	_note_editor_run_source(compiled, "editor_run %d code" % id)
 	# The entry is complete before the code starts: the code can process frames
 	# (reimport_files() does) before its first await, and _process then looks at it.
 	var entry := {"run": code_runner_script.prepare(compiled.script), "capture": capture, "compiled": compiled, "started": Time.get_ticks_msec(), "logs": []}
@@ -487,6 +507,21 @@ func _run(code: String, sync: bool, timeout: float) -> Dictionary:
 	if entry.has("outcome"):
 		return _run_reply(id)
 	return _run_progress(id, "The code is still running after %d s. Collect its result with editor_result (run_id %d) or stop it with editor_cancel." % [int(timeout), id])
+
+func _note_editor_run_source(compiled: Dictionary, label: String) -> void:
+	_editor_run_sources.append({"path": compiled.path, "line_offset": compiled.line_offset, "label": label})
+	if _editor_run_sources.size() > EDITOR_RUN_SOURCES_KEPT:
+		_editor_run_sources.pop_front()
+
+## line with locations in compiled editor_run code rewritten to that code's
+## own lines, as "editor_run 12 code:3" (run 12, line 3 of its code).
+func _editor_run_locations(line: String) -> String:
+	if not line.contains("gdscript://"):
+		return line
+	for source: Dictionary in _editor_run_sources:
+		if line.contains(source.path + ":"):
+			line = code_runner_script.code_locations(PackedStringArray([line]), source, source.label)[0]
+	return line
 
 ## Finishes runs that have returned (or were cancelled): stops their log
 ## capture and keeps their reply. Drops the oldest finished runs beyond EDITOR_RUNS_KEPT.
@@ -616,11 +651,20 @@ const TEST_DIRS := ["res://tests", "res://test"]
 const TEST_TIMEOUT_SECONDS := 120.0
 ## Output lines kept per test script, the last ones.
 const TEST_OUTPUT_KEPT := 40
-var _test_runner_regex := RegEx.create_from_string("(?m)^extends\\s+(SceneTree|MainLoop)\\b")
+## How many test scripts run at once: by default a third of the CPU cores, up
+## to TEST_JOBS_DEFAULT_MAX, and at most TEST_JOBS_MAX. Tests with tight time
+## limits of their own can fail when too many share the CPU.
+const TEST_JOBS_DEFAULT_MAX := 4
+const TEST_JOBS_MAX := 16
+## Engine messages printed as a script quits (leaked objects and resources),
+## reported apart from its errors: they rarely mean a test is wrong.
+const TEST_EXIT_NOISE := [" at exit", "was leaked"]
+var _extends_regex := RegEx.create_from_string("(?m)^extends\\s+(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z_][\\w.]*))")
+var _initialize_regex := RegEx.create_from_string("(?m)^func\\s+_initialize\\s*\\(")
 
 ## run_tests: syncs first, so headless runs see new class_names (they read the
 ## class cache the editor's scan writes), then runs each test script in its own
-## headless Godot, one after another without blocking the editor. A script
+## headless Godot, several at once (jobs) without blocking the editor. A script
 ## passes when its process exits with code 0, as quit(0) does.
 func _run_tests(args: Dictionary) -> Dictionary:
 	await _sync()
@@ -630,7 +674,7 @@ func _run_tests(args: Dictionary) -> Dictionary:
 		for item in given:
 			var path := _res_path(String(item))
 			if DirAccess.dir_exists_absolute(path):
-				scripts.append_array(_find_test_scripts(path))
+				scripts.append_array(_without_test_bases(_find_test_scripts(path)))
 			elif FileAccess.file_exists(path):
 				scripts.append(path)
 			else:
@@ -639,6 +683,7 @@ func _run_tests(args: Dictionary) -> Dictionary:
 		for folder in TEST_DIRS:
 			if DirAccess.dir_exists_absolute(folder):
 				scripts.append_array(_find_test_scripts(folder))
+		scripts = _without_test_bases(scripts)
 	if scripts.is_empty():
 		return {"error": "No test scripts found. Pass scripts: scripts that extend SceneTree or MainLoop (or folders of them), or a test framework's command-line runner with its options in args. Without scripts, %s are searched." % " and ".join(TEST_DIRS)}
 	var extra := PackedStringArray()
@@ -646,32 +691,125 @@ func _run_tests(args: Dictionary) -> Dictionary:
 		for item in args.args:
 			extra.append(String(item))
 	var timeout := maxf(1.0, float(args.get("timeout", TEST_TIMEOUT_SECONDS)))
+	# Empty by default, unlike game_play: a test's outcome should not depend on
+	# whatever saves and settings the person running it has.
+	var user_data := String(args.get("user_data", "empty"))
+	if not user_data in USER_DATA_MODES:
+		return {"error": "user_data is one of %s." % ", ".join(USER_DATA_MODES)}
+	var details := String(args.get("details", "failures"))
+	if not details in ["failures", "all"]:
+		return {"error": "details is failures or all."}
+	var jobs := clampi(int(args.get("jobs", clampi(OS.get_processor_count() / 3, 1, TEST_JOBS_DEFAULT_MAX))), 1, TEST_JOBS_MAX)
+	var started := Time.get_ticks_msec()
 	var results := []
-	var failed := 0
-	for script in scripts:
-		var result := await _run_test_script(script, extra, timeout)
-		if not result.passed:
-			failed += 1
-		results.append(result)
-	return {"passed": scripts.size() - failed, "failed": failed, "results": results}
+	results.resize(scripts.size())
+	# Each worker runs one script at a time, taking the next one not yet started.
+	var state := {"next": 0, "workers": mini(jobs, scripts.size())}
+	var worker := func(slot: int) -> void:
+		while state.next < scripts.size():
+			var index: int = state.next
+			state.next += 1
+			# A fresh folder for every script, so one test's saves cannot change another's.
+			var data_home: Variant = null
+			if user_data != "real":
+				data_home = OS.get_temp_dir().path_join("godot_bridge_test_data").path_join(str(slot))
+				_make_user_data(user_data, data_home)
+			results[index] = await _run_test_script(scripts[index], extra, timeout, data_home)
+		state.workers -= 1
+	for slot in state.workers:
+		worker.call(slot)
+	while state.workers > 0:
+		await get_tree().process_frame
+	var failed := results.filter(func(result: Dictionary) -> bool: return not result.passed)
+	var reply := {"passed": scripts.size() - failed.size(), "failed": failed.size(), "seconds": snappedf((Time.get_ticks_msec() - started) / 1000.0, 0.1), "user_data": user_data}
+	if details == "all":
+		reply.results = results
+		return reply
+	if not failed.is_empty():
+		reply.failures = failed
+	# Passing scripts that printed errors or warnings, without their output.
+	var noisy := []
+	for result: Dictionary in results:
+		if result.passed and (not result.errors.is_empty() or not result.warnings.is_empty() or result.has("exit_warnings")):
+			var entry := {"script": result.script}
+			for key in ["errors", "warnings", "exit_warnings"]:
+				if not result.get(key, []).is_empty():
+					entry[key] = result[key]
+			noisy.append(entry)
+	if not noisy.is_empty():
+		reply.noisy = noisy
+	return reply
 
-## The scripts under folder that extend SceneTree or MainLoop, so `-s` runs them.
+## The scripts under folder that extend SceneTree or MainLoop, directly or
+## through other scripts, so `-s` runs them.
 func _find_test_scripts(folder: String) -> PackedStringArray:
 	var found := PackedStringArray()
+	var global_classes := _global_class_paths()
 	for file in DirAccess.get_files_at(folder):
 		var path := folder.path_join(file)
-		if file.get_extension() == "gd" and _test_runner_regex.search(FileAccess.get_file_as_string(path)) != null:
+		if file.get_extension() == "gd" and _extends_main_loop(path, global_classes):
 			found.append(path)
 	for sub in DirAccess.get_directories_at(folder):
 		found.append_array(_find_test_scripts(folder.path_join(sub)))
 	return found
 
+## class_name -> script path, for the project's named scripts.
+func _global_class_paths() -> Dictionary:
+	var paths := {}
+	for entry in ProjectSettings.get_global_class_list():
+		paths[String(entry["class"])] = String(entry.path)
+	return paths
+
+## Whether the script at path extends SceneTree or MainLoop, following its
+## extends chain through script paths and class_names.
+func _extends_main_loop(path: String, global_classes: Dictionary, depth := 0) -> bool:
+	var parent := _extended_script(path, global_classes)
+	if parent in ["SceneTree", "MainLoop"]:
+		return true
+	return depth < 16 and parent.ends_with(".gd") and _extends_main_loop(parent, global_classes, depth + 1)
+
+## What the script at path extends: a script's path, a native class's name, or "".
+func _extended_script(path: String, global_classes: Dictionary) -> String:
+	var found := _extends_regex.search(FileAccess.get_file_as_string(path))
+	if found == null:
+		return ""
+	var given := found.get_string(1) + found.get_string(2)
+	if not given.is_empty():
+		return given if given.begins_with("res://") else path.get_base_dir().path_join(given).simplify_path()
+	var name := found.get_string(3).get_slice(".", 0)
+	return global_classes.get(name, name)
+
+## scripts without the bases other test scripts extend (helpers such as a
+## test_base.gd that only sets up), unless they define _initialize, as a test
+## of their own does.
+func _without_test_bases(scripts: PackedStringArray) -> PackedStringArray:
+	var global_classes := _global_class_paths()
+	var bases := {}
+	for script in scripts:
+		bases[_extended_script(script, global_classes)] = true
+	var kept := PackedStringArray()
+	for script in scripts:
+		if not bases.has(script) or _initialize_regex.search(FileAccess.get_file_as_string(script)) != null:
+			kept.append(script)
+	return kept
+
 ## Runs one script with `godot --headless -s`, reading its output as it comes
-## so the editor keeps running. Killed after timeout seconds.
-func _run_test_script(script: String, extra: PackedStringArray, timeout: float) -> Dictionary:
+## so the editor keeps running. Killed after timeout seconds. With data_home,
+## the script runs with _data_home_variable set to it (see _make_user_data()).
+func _run_test_script(script: String, extra: PackedStringArray, timeout: float, data_home: Variant = null) -> Dictionary:
 	var arguments := PackedStringArray(["--headless", "--path", ProjectSettings.globalize_path("res://"), "-s", script])
 	arguments.append_array(extra)
+	# The process inherits the editor's environment as it starts, so the
+	# variable is changed only for that moment (a game being started may have it set too).
+	var saved: Variant = OS.get_environment(_data_home_variable) if OS.has_environment(_data_home_variable) else null
+	if data_home != null:
+		OS.set_environment(_data_home_variable, data_home)
 	var process := OS.execute_with_pipe(OS.get_executable_path(), arguments, false)
+	if data_home != null:
+		if saved == null:
+			OS.unset_environment(_data_home_variable)
+		else:
+			OS.set_environment(_data_home_variable, saved)
 	if process.is_empty():
 		return {"script": script, "passed": false, "error": "Could not start a headless Godot."}
 	var pipes: Array[FileAccess] = [process.stdio, process.stderr]
@@ -693,13 +831,23 @@ func _run_test_script(script: String, extra: PackedStringArray, timeout: float) 
 	for pipe in pipes:
 		pipe.close()
 	var exit_code := OS.get_process_exit_code(process.pid)
-	# Errors with the "at:" line that says where, as one line each.
+	# Errors and warnings with the "at:" line that says where, as one line each.
 	var errors := PackedStringArray()
+	var warnings := PackedStringArray()
+	var exit_warnings := PackedStringArray()
 	for i in lines.size():
 		var line := lines[i].strip_edges()
-		if line.begins_with("SCRIPT ERROR:") or line.begins_with("ERROR:") or line.begins_with("USER ERROR:"):
-			var at := lines[i + 1].strip_edges() if i + 1 < lines.size() else ""
-			errors.append(line + (" (%s)" % at.trim_prefix("at: ") if at.begins_with("at:") else ""))
+		var is_error := line.begins_with("SCRIPT ERROR:") or line.begins_with("ERROR:") or line.begins_with("USER ERROR:")
+		if not is_error and not line.begins_with("WARNING:") and not line.begins_with("USER WARNING:"):
+			continue
+		var at := lines[i + 1].strip_edges() if i + 1 < lines.size() else ""
+		line += " (%s)" % at.trim_prefix("at: ") if at.begins_with("at:") else ""
+		if TEST_EXIT_NOISE.any(func(noise: String) -> bool: return line.contains(noise)):
+			exit_warnings.append(line)
+		elif is_error:
+			errors.append(line)
+		else:
+			warnings.append(line)
 	var result := {
 		"script": script,
 		"passed": not timed_out and exit_code == 0,
@@ -707,8 +855,11 @@ func _run_test_script(script: String, extra: PackedStringArray, timeout: float) 
 		"exit_code": null if timed_out else exit_code,
 		"seconds": snappedf((Time.get_ticks_msec() - started) / 1000.0, 0.01),
 		"errors": errors,
+		"warnings": warnings,
 		"output": lines.slice(maxi(0, lines.size() - TEST_OUTPUT_KEPT)),
 	}
+	if not exit_warnings.is_empty():
+		result.exit_warnings = exit_warnings
 	if timed_out:
 		result.note = "Stopped after %d s. A script must call quit() when done, or it runs forever; a script error before quit() leaves it running too. Pass a longer timeout if it needs more." % int(timeout)
 	return result
@@ -725,45 +876,90 @@ func _read_test_pipes(pipes: Array[FileAccess], partial: Array, lines: PackedStr
 					lines.append(line)
 			chunk = pipes[i].get_buffer(65536)
 
-## Records the file times of open scenes not seen before (just opened).
+## Records the file times of open scenes not seen before (just opened), and
+## of the scenes they instance.
 func note_open_scenes() -> void:
 	for path in EditorInterface.get_open_scenes():
 		if not _scene_times.has(path):
 			_scene_times[path] = FileAccess.get_modified_time(path)
+		# Also for scenes handed over by a bridge from before these were kept.
+		if not _dependency_times.has(path):
+			_dependency_times[path] = _scene_dependency_times(path)
 
-## The editor saved a scene, so its file's new time is the editor's own.
+## The editor saved a scene, so its file's new time is the editor's own. The
+## editor updates the instances of a scene it saved in the other open scenes
+## itself, so those are not stale either.
 func note_scene_saved(path: String) -> void:
+	var time := FileAccess.get_modified_time(path)
 	if _scene_times.has(path) or EditorInterface.get_open_scenes().has(path):
-		_scene_times[path] = FileAccess.get_modified_time(path)
+		_scene_times[path] = time
+		_dependency_times[path] = _scene_dependency_times(path)
+	for times: Dictionary in _dependency_times.values():
+		if times.has(path):
+			times[path] = time
 
 func forget_scene(path: String) -> void:
 	_scene_times.erase(path)
+	_dependency_times.erase(path)
+
+## The scenes path instances, directly or through other instanced scenes,
+## with their files' modified times.
+func _scene_dependency_times(path: String, times := {}) -> Dictionary:
+	for dependency in ResourceLoader.get_dependencies(path):
+		# Entries look like "uid://...::::res://house.tscn" or a plain path.
+		var dependency_path := dependency.get_slice("::", dependency.get_slice_count("::") - 1)
+		if dependency_path.begins_with("uid://"):
+			dependency_path = ResourceUID.get_id_path(ResourceUID.text_to_id(dependency_path))
+		if not dependency_path.get_extension() in ["tscn", "scn"] or times.has(dependency_path):
+			continue
+		times[dependency_path] = FileAccess.get_modified_time(dependency_path)
+		_scene_dependency_times(dependency_path, times)
+	return times
 
 ## Reloads open scenes whose files changed on disk since the editor loaded or
 ## saved them, before the editor notices them itself (on focus, on play) and
-## asks with its "Files have been modified outside Godot" dialog. A scene with
-## unsaved edits in the editor is left to that dialog, since both copies changed.
+## asks with its "Files have been modified outside Godot" dialog. Open scenes
+## that instance a scene changed on disk are reloaded too: the editor keeps
+## their old instances, and saving would write those back. A scene with
+## unsaved edits in the editor is left alone, since both copies changed.
 func _reload_changed_scenes() -> Dictionary:
 	note_open_scenes()
 	var reloaded := []
 	var conflicts := []
+	var stale := []
 	var unsaved := EditorInterface.get_unsaved_scenes()
 	for path in EditorInterface.get_open_scenes():
 		var on_disk := FileAccess.get_modified_time(path)
-		if on_disk <= int(_scene_times.get(path, on_disk)):
+		var changed := on_disk > int(_scene_times.get(path, on_disk))
+		var changed_instances := []
+		var recorded: Dictionary = _dependency_times.get(path, {})
+		for dependency in recorded:
+			if FileAccess.get_modified_time(dependency) > int(recorded[dependency]):
+				changed_instances.append(dependency)
+		if not changed and changed_instances.is_empty():
 			continue
 		if unsaved.has(path):
-			conflicts.append(path)
+			if changed:
+				conflicts.append(path)
+			else:
+				stale.append({"scene": path, "changed_instances": changed_instances})
 			continue
 		EditorInterface.reload_scene_from_path(path)
 		_scene_times[path] = on_disk
+		_dependency_times[path] = _scene_dependency_times(path)
 		reloaded.append(path)
 	var outcome := {}
 	if not reloaded.is_empty():
 		outcome.reloaded_scenes = reloaded
+	var notes := PackedStringArray()
 	if not conflicts.is_empty():
 		outcome.unsaved_conflicts = conflicts
-		outcome.note = "These scenes changed on disk but also have unsaved edits in the editor, so they were not reloaded; the editor will ask which copy to keep."
+		notes.append("unsaved_conflicts changed on disk but also have unsaved edits in the editor, so they were not reloaded; the editor will ask which copy to keep.")
+	if not stale.is_empty():
+		outcome.stale_unsaved_scenes = stale
+		notes.append("stale_unsaved_scenes instance scenes that changed on disk, but have unsaved edits in the editor, so they were not reloaded and still hold the old instances: saving them would write those back. Reload them (EditorInterface.reload_scene_from_path) to drop the unsaved edits, or redo the edits on disk.")
+	if not notes.is_empty():
+		outcome.note = " ".join(notes)
 	return outcome
 
 ## Reads one imported asset's import settings, or changes them on every file
@@ -1139,21 +1335,26 @@ func _await_game_start(background: bool) -> Dictionary:
 ## game inherits the editor's environment, so _data_home_variable is set until
 ## it has started (_restore_data_home). Returns the game's user:// folder.
 func _prepare_user_data(user_data: String) -> String:
-	var real := OS.get_user_data_dir()
 	if user_data == "real":
-		return real
-	# Only ever this one folder is cleared out.
+		return OS.get_user_data_dir()
 	var variable_value := OS.get_temp_dir().path_join("godot_bridge_user_data")
-	_remove_tree(variable_value)
-	var data_home := _data_home_for(variable_value)
-	# The user folder's place under the data folder, e.g. godot/app_userdata/<name>.
-	var game_dir := data_home.path_join(real.trim_prefix(OS.get_data_dir()).trim_prefix("/"))
-	DirAccess.make_dir_recursive_absolute(game_dir)
-	if user_data == "copy":
-		_copy_tree(real, game_dir, USER_DATA_SKIPPED)
+	var game_dir := _make_user_data(user_data, variable_value)
 	_saved_data_home = OS.get_environment(_data_home_variable) if OS.has_environment(_data_home_variable) else null
 	_data_home_set = true
 	OS.set_environment(_data_home_variable, variable_value)
+	return game_dir
+
+## Clears out variable_value, a folder only the bridge uses, and sets up a
+## user:// folder under it as a game finds it with _data_home_variable set to
+## variable_value: a copy of the real one, or empty. Returns that folder.
+func _make_user_data(user_data: String, variable_value: String) -> String:
+	var real := OS.get_user_data_dir()
+	_remove_tree(variable_value)
+	# The user folder's place under the data folder, e.g. godot/app_userdata/<name>.
+	var game_dir := _data_home_for(variable_value).path_join(real.trim_prefix(OS.get_data_dir()).trim_prefix("/"))
+	DirAccess.make_dir_recursive_absolute(game_dir)
+	if user_data == "copy":
+		_copy_tree(real, game_dir, USER_DATA_SKIPPED)
 	return game_dir
 
 ## The data folder Godot uses when _data_home_variable is value: the value
@@ -1276,6 +1477,7 @@ func _play_background(scene: String) -> String:
 	_background_pid = process.pid
 	_background_pipes = [process.stdio, process.stderr]
 	_background_partial = ["", ""]
+	_background_in_noise = [false, false]
 	_background_output = []
 	_background_scene = scene
 	return ""
@@ -1294,7 +1496,12 @@ func _read_background_output() -> void:
 		lines.resize(lines.size() - 1)
 		for line in lines:
 			line = _terminal_colours.sub(line, "", true).strip_edges(false, true)
-			if not line.strip_edges().is_empty() and not BACKGROUND_NOISE.any(func(noise: String) -> bool: return line.begins_with(noise)):
+			if line.strip_edges().is_empty():
+				continue
+			var continues := line.begins_with(" ") or line.begins_with("\t")
+			if not continues:
+				_background_in_noise[i] = BACKGROUND_NOISE.any(func(noise: String) -> bool: return line.begins_with(noise))
+			if not _background_in_noise[i]:
 				_background_output.append(line)
 	if _background_output.size() > BACKGROUND_OUTPUT_KEPT:
 		_background_output = _background_output.slice(_background_output.size() - BACKGROUND_OUTPUT_KEPT)
@@ -1519,9 +1726,10 @@ func _screenshot_path() -> String:
 # --- Diagnostics, editor log and scene screenshots ----------------------------
 
 ## Compiles scripts fresh from disk (and with scenes, loads scenes) and
-## reports every error with its file and line. Without paths it checks the
+## reports every error with its file and line, and with warnings the scripts'
+## GDScript warnings (see _script_warnings()). Without paths it checks the
 ## whole project except res://addons/.
-func _diagnostics(paths: Array, scenes: bool) -> Dictionary:
+func _diagnostics(paths: Array, scenes: bool, warnings := true) -> Dictionary:
 	await _sync()
 	var scripts := PackedStringArray()
 	var scene_files := PackedStringArray()
@@ -1549,7 +1757,124 @@ func _diagnostics(paths: Array, scenes: bool) -> Dictionary:
 		if loaded == null or not messages.is_empty():
 			problems.append({"path": path, "messages": messages if not messages.is_empty() else PackedStringArray(["Failed to load."])})
 	OS.remove_logger(capture)
-	return {"ok": problems.is_empty(), "scripts_checked": scripts.size(), "scenes_checked": scene_files.size(), "problems": problems}
+	var reply := {"ok": problems.is_empty(), "scripts_checked": scripts.size(), "scenes_checked": scene_files.size(), "problems": problems}
+	if warnings:
+		var found := await _script_warnings(Array(scripts).filter(func(path: String) -> bool: return FileAccess.file_exists(path)))
+		if found.has("error"):
+			reply.warnings_note = found.error
+		else:
+			reply.warning_count = found.warnings.reduce(func(total: int, entry: Dictionary) -> int: return total + entry.messages.size(), 0)
+			reply.warnings = found.warnings
+	return reply
+
+# --- GDScript warnings, from the editor's language server --------------------
+
+## How long _script_warnings() waits to connect, and for all its answers.
+const LSP_CONNECT_TIMEOUT_MS := 3000
+const LSP_ANSWER_TIMEOUT_MS := 20000
+
+## {"warnings": [{path, messages}]} for the scripts at paths that have any, as
+## the script editor shows them, or {"error"}. Godot reports GDScript warnings
+## only to the script editor and the debugger, never to loggers, so they come
+## from the editor's GDScript language server, which analyzes each script sent
+## to it with the project's warning settings.
+func _script_warnings(paths: Array) -> Dictionary:
+	if paths.is_empty():
+		return {"warnings": []}
+	var settings := EditorInterface.get_editor_settings()
+	var host := String(settings.get_setting("network/language_server/remote_host"))
+	var port := int(settings.get_setting("network/language_server/remote_port"))
+	var peer := StreamPeerTCP.new()
+	var unavailable := "Warnings were not checked: the editor's GDScript language server (%s:%d, Editor Settings > Network > Language Server) did not answer." % [host, port]
+	if peer.connect_to_host(host, port) != OK:
+		return {"error": unavailable}
+	var started := Time.get_ticks_msec()
+	while peer.get_status() == StreamPeerTCP.STATUS_CONNECTING and Time.get_ticks_msec() - started < LSP_CONNECT_TIMEOUT_MS:
+		await get_tree().process_frame
+		peer.poll()
+	if peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+		return {"error": unavailable}
+	var buffer := [PackedByteArray()]
+	var root_uri := _file_uri(ProjectSettings.globalize_path("res://"))
+	_lsp_send(peer, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"processId": OS.get_process_id(), "rootUri": root_uri, "capabilities": {}}})
+	var initialized := false
+	var by_uri := {}
+	for path: String in paths:
+		by_uri[_file_uri(ProjectSettings.globalize_path(path)).uri_decode()] = path
+	var answered := {}
+	var found := {}
+	started = Time.get_ticks_msec()
+	while answered.size() < by_uri.size() and Time.get_ticks_msec() - started < LSP_ANSWER_TIMEOUT_MS:
+		peer.poll()
+		if peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			break
+		var message: Variant = _lsp_receive(peer, buffer)
+		if message == null:
+			await get_tree().process_frame
+			continue
+		if not initialized and message.get("id") == 1:
+			initialized = true
+			_lsp_send(peer, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+			for path: String in paths:
+				var uri := _file_uri(ProjectSettings.globalize_path(path))
+				_lsp_send(peer, {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri, "languageId": "gdscript", "version": 1, "text": FileAccess.get_file_as_string(path)}}})
+				_lsp_send(peer, {"jsonrpc": "2.0", "method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}})
+		elif message.get("method") == "textDocument/publishDiagnostics":
+			var path: String = by_uri.get(String(message.params.uri).uri_decode(), "")
+			# didClose answers with an empty list of its own, after the real one.
+			if path.is_empty() or answered.has(path):
+				continue
+			answered[path] = true
+			for diagnostic: Dictionary in message.params.diagnostics:
+				if int(diagnostic.get("severity", 0)) == 2:
+					found[path] = found.get(path, PackedStringArray()) + PackedStringArray(["WARNING: %s (%s:%d)" % [diagnostic.message, path, int(diagnostic.range.start.line) + 1]])
+	peer.disconnect_from_host()
+	if not initialized:
+		return {"error": unavailable}
+	var warnings := []
+	for path: String in paths:
+		if found.has(path):
+			warnings.append({"path": path, "messages": found[path]})
+	var reply := {"warnings": warnings}
+	if answered.size() < by_uri.size():
+		reply.error = "Warnings were checked for only %d of %d scripts: the language server stopped answering." % [answered.size(), by_uri.size()]
+	return reply
+
+## A file:// URI for an absolute path, as the language server writes them.
+func _file_uri(path: String) -> String:
+	var parts := PackedStringArray()
+	for part in path.split("/"):
+		parts.append(part.uri_encode())
+	return "file://" + ("" if path.begins_with("/") else "/") + "/".join(parts)
+
+func _lsp_send(peer: StreamPeerTCP, message: Dictionary) -> void:
+	var body := JSON.stringify(message).to_utf8_buffer()
+	peer.put_data(("Content-Length: %d\r\n\r\n" % body.size()).to_ascii_buffer() + body)
+
+## The next whole message from the language server, or null while none has
+## fully arrived. buffer holds what was read past it.
+func _lsp_receive(peer: StreamPeerTCP, buffer: Array) -> Variant:
+	var available := peer.get_available_bytes()
+	if available > 0:
+		buffer[0] += peer.get_data(available)[1]
+	var data: PackedByteArray = buffer[0]
+	var header_end := -1
+	for i in range(0, data.size() - 3):
+		if data[i] == 13 and data[i + 1] == 10 and data[i + 2] == 13 and data[i + 3] == 10:
+			header_end = i
+			break
+	if header_end < 0:
+		return null
+	var length := -1
+	for line in data.slice(0, header_end).get_string_from_ascii().split("\r\n"):
+		if line.to_lower().begins_with("content-length:"):
+			length = int(line.get_slice(":", 1).strip_edges())
+	var body_start := header_end + 4
+	if length < 0 or data.size() < body_start + length:
+		return null
+	buffer[0] = data.slice(body_start + length)
+	var message: Variant = JSON.parse_string(data.slice(body_start, body_start + length).get_string_from_utf8())
+	return message if message is Dictionary else {}
 
 func _collect_files(folder: EditorFileSystemDirectory, scripts: PackedStringArray, scene_files: PackedStringArray) -> void:
 	if folder.get_path().begins_with("res://addons/"):
@@ -1587,7 +1912,7 @@ func _editor_log_reply(count: int, clear: bool, level: String) -> Dictionary:
 		var is_error := line.begins_with("ERROR:") or line.begins_with("SCRIPT ERROR:") or line.begins_with("SHADER ERROR:")
 		if level == "errors" and not is_error or level == "warnings" and not is_error and not line.begins_with("WARNING:"):
 			continue
-		shown.append(log_capture_script.format(entry))
+		shown.append(_editor_run_locations(log_capture_script.format(entry)))
 	shown.reverse()
 	if clear:
 		_editor_log_lines = []
@@ -1710,6 +2035,10 @@ func _render_animation_frames(viewport: SubViewport, instance: Node, args: Dicti
 			times.append(0.0 if count == 1 else length * i / (count - 1))
 
 	var info := _animation_info(player, animation_name, instance, pose, String(args.get("root_bone", "")))
+	if instance is Node3D and not _draws_anything_3d(instance):
+		var skeletons := instance.find_children("*", "Skeleton3D", true, false)
+		if not skeletons.is_empty():
+			return {"error": "%s has a skeleton (%d bones) but no mesh, so every frame would be empty: it holds animations only. Add the animation to the character it is made for and pose that scene instead." % [args.get("scene", ""), skeletons.map(func(skeleton: Skeleton3D) -> int: return skeleton.get_bone_count()).reduce(func(a: int, b: int) -> int: return a + b, 0)]}
 
 	var framing := {}
 	if instance is Node2D:
@@ -1872,6 +2201,13 @@ func pose_scene(scene: Variant, animation: String, time: float, player: String) 
 
 ## Gives top-level Controls the project theme: inside the editor they would
 ## otherwise inherit the editor's own theme.
+## Whether anything under root renders in 3D: a mesh, sprite, CSG shape or the like.
+func _draws_anything_3d(root: Node) -> bool:
+	for geometry: GeometryInstance3D in root.find_children("*", "GeometryInstance3D", true, false):
+		if not (geometry is MeshInstance3D and geometry.mesh == null):
+			return true
+	return false
+
 func _apply_project_theme(node: Node) -> void:
 	var theme_path := String(ProjectSettings.get_setting("gui/theme/custom", ""))
 	if theme_path.is_empty():
