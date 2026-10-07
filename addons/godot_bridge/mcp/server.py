@@ -43,7 +43,8 @@ TOOLS = [
             "editor_result or stop it with editor_cancel. Code that never awaits blocks the editor until it "
             "returns and cannot be cancelled, so make long jobs await now and then. A result too long for a reply "
             "(over 40,000 characters) is saved to a file and replaced by a summary of its shape (its largest keys, "
-            "first and largest items, with sizes), and output and logs keep their last 300 lines."
+            "first and largest items, with sizes), and output and logs keep their last 300 lines. Every reply has the "
+            "run's run_id, which editor_log uses for errors the code causes later (editor_run 12 code:3)."
         ),
         "inputSchema": {
             "type": "object",
@@ -306,7 +307,7 @@ TOOLS = [
     },
     {
         "name": "editor_log",
-        "description": "Recent output of the Godot editor: printed lines, warnings and errors, including those raised while syncing or importing (the last 500 are kept). Locations in editor_run code read as \"editor_run 12 code:3\" (run 12, line 3 of its code), also for errors raised after the run, such as from deferred calls or signal callbacks it connected. A line that repeats while it is among the last few kept, such as warnings printed every frame, is kept once with its count, as \"<line> (N times)\", and moves to the end as the most recent.",
+        "description": "Recent output of the Godot editor: printed lines, warnings and errors, including those raised while syncing or importing (the last 500 are kept). Locations in editor_run code read as \"editor_run 12 code:3\" (line 3 of the code of the run whose reply had run_id 12), also for errors raised after the run, such as from deferred calls or signal callbacks it connected. A line that repeats while it is among the last few kept, such as warnings printed every frame, is kept once with its count, as \"<line> (N times)\", and moves to the end as the most recent.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -542,21 +543,49 @@ def _own_source_hash():
         return None
 
 
+def _tools_hash(tools):
+    return hashlib.sha256(json.dumps(tools, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 # The tool definitions the client got are the ones in this file as it was when
 # this process started. The client drops arguments it does not know of
-# without a word, so a changed file is reported on every reply until a reconnect.
+# without a word, so once the definitions in the file change (not just other
+# code, such as VERSION), the next reply says so, once per change.
 STARTED_SOURCE = _own_source_hash()
+STARTED_TOOLS = _tools_hash(TOOLS)
 STALE_NOTE = (
-    "Note: mcp/server.py has changed since this MCP server started, so the client still has the old tool "
-    "definitions and silently drops arguments added since. Reconnect the MCP server (/mcp in Claude Code) "
-    "to load the new ones."
+    "Note: the tool definitions in mcp/server.py have changed since this MCP server started, so the client "
+    "still has the old ones and silently drops arguments added since. Reconnect the MCP server (/mcp in "
+    "Claude Code) to load the new ones. (Shown once per change.)"
 )
+# Source hash -> hash of the tool definitions in that source (None: unreadable).
+_tools_by_source = {STARTED_SOURCE: STARTED_TOOLS}
+_reported_tools = None
+
+
+def _current_tools_hash():
+    source = _own_source_hash()
+    if source is None:
+        return None
+    if source not in _tools_by_source:
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("godot_bridge_server_check", __file__)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _tools_by_source[source] = _tools_hash(module.TOOLS)
+        except Exception:
+            # A file midway through an edit may not load; it is checked again next time.
+            return None
+    return _tools_by_source[source]
 
 
 def call_tool(name, args):
+    global _reported_tools
     result = _call_tool(name, args)
-    current = _own_source_hash()
-    if STARTED_SOURCE is not None and current is not None and current != STARTED_SOURCE:
+    current = _current_tools_hash()
+    if current is not None and current != STARTED_TOOLS and current != _reported_tools:
+        _reported_tools = current
         result["content"].append({"type": "text", "text": STALE_NOTE})
     return result
 

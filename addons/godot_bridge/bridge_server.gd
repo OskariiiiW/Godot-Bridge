@@ -549,10 +549,11 @@ func _finish_editor_runs() -> void:
 	while finished.size() > EDITOR_RUNS_KEPT:
 		_editor_runs.erase(finished.pop_front())
 
-## A finished run's reply. Its run_id is only needed while it runs, and its
-## time only when it took long enough to matter.
+## A finished run's reply, with its run_id, which editor_log names it by (see
+## _editor_run_locations()), and its time only when it took long enough to matter.
 func _run_reply(id: int) -> Dictionary:
 	var outcome: Dictionary = _editor_runs[id].outcome.duplicate()
+	outcome.run_id = id
 	if outcome.seconds < 1.0:
 		outcome.erase("seconds")
 	return code_runner_script.trimmed(outcome)
@@ -730,10 +731,10 @@ func _run_tests(args: Dictionary) -> Dictionary:
 	# Passing scripts that printed errors or warnings, without their output.
 	var noisy := []
 	for result: Dictionary in results:
-		if result.passed and (not result.errors.is_empty() or not result.warnings.is_empty() or result.has("exit_warnings")):
+		if result.passed and (result.has("errors") or result.has("warnings") or result.has("exit_warnings")):
 			var entry := {"script": result.script}
 			for key in ["errors", "warnings", "exit_warnings"]:
-				if not result.get(key, []).is_empty():
+				if result.has(key):
 					entry[key] = result[key]
 			noisy.append(entry)
 	if not noisy.is_empty():
@@ -862,7 +863,7 @@ func _run_test_script(script: String, extra: PackedStringArray, timeout: float, 
 		result.exit_warnings = exit_warnings
 	if timed_out:
 		result.note = "Stopped after %d s. A script must call quit() when done, or it runs forever; a script error before quit() leaves it running too. Pass a longer timeout if it needs more." % int(timeout)
-	return result
+	return code_runner_script.trimmed(result, ["errors", "warnings", "output"])
 
 func _read_test_pipes(pipes: Array[FileAccess], partial: Array, lines: PackedStringArray) -> void:
 	for i in pipes.size():
