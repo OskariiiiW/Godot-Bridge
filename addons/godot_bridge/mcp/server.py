@@ -18,7 +18,7 @@ import sys
 PROJECT = os.environ.get("GODOT_BRIDGE_PROJECT") or os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 CONNECTION_DIR = os.path.join(PROJECT, ".godot", "godot_bridge")
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 TIMEOUT = float(os.environ.get("GODOT_BRIDGE_TIMEOUT", "120"))
 
 TOOLS = [
